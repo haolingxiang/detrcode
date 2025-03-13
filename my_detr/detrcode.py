@@ -6,6 +6,8 @@ DETR完整实现 v3.0
 """
 import os
 import json
+from typing import List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +21,9 @@ from pycocotools.coco import COCO
 from pycocotools import mask as maskUtils
 from tqdm import tqdm
 import torchvision.models as models
+from torchvision.datasets import CocoDetection
+import datasets.transforms as T
+from util.misc import collate_fn
 
 
 # === 配置参数 ===
@@ -39,167 +44,190 @@ class Config:
     output_dir = "./outputs"
 
 
-# === 数据加载 ===
-class DOTA2COCO(torchvision.datasets.CocoDetection):
+# === 转换dota数据为coco形式 ===
+def convert_dota_to_coco(root, output_path):
+    """
+    实现DOTA原生格式到COCO格式的转换
+    输入结构：
+    root/
+      ├── images/  # 存放所有图像文件
+      └── labelTxt/  # 存放DOTA格式的txt标注文件
+    """
+    # 初始化COCO结构
+    coco_dict = {
+        "info": {"description": "DOTA-COCO Format"},
+        "images": [],
+        "annotations": [],
+        "categories": []
+    }
+
+    # === 1. 构建类别映射 ===
+    class_names = [
+        'plane', 'ship', 'storage-tank', 'baseball-diamond', 'tennis-court',
+        'basketball-court', 'ground-track-field', 'harbor', 'bridge',
+        'large-vehicle', 'small-vehicle', 'helicopter', 'roundabout',
+        'soccer-ball-field', 'swimming-pool'
+    ]
+    coco_dict["categories"] = [{"id": i + 1, "name": n} for i, n in enumerate(class_names)]
+
+    # === 2. 遍历所有图像 ===
+    img_dir = os.path.join(root, "images")
+    ann_dir = os.path.join(root, "labelTxt")
+    img_files = [f for f in os.listdir(img_dir) if f.lower().endswith(('.png', '.jpg'))]
+
+    ann_id = 0
+    for img_id, img_file in enumerate(tqdm(img_files)):
+        # 获取图像尺寸
+        img_path = os.path.join(img_dir, img_file)
+        img = cv2.imread(img_path)
+        height, width = img.shape[:2]
+
+        # 添加图像记录
+        coco_dict["images"].append({
+            "id": img_id,
+            "file_name": img_file,
+            "width": width,
+            "height": height
+        })
+
+        # === 3. 解析DOTA标注 ===
+        ann_file = os.path.join(ann_dir, img_file.replace('.png', '.txt').replace('.jpg', '.txt'))
+        if not os.path.exists(ann_file):
+            continue
+
+        with open(ann_file, 'r') as f:
+            lines = [line.strip().split() for line in f if line.startswith('gsd') is False]
+
+        for line in lines:
+            if len(line) < 9: continue
+
+            # 解析DOTA多边形坐标（8点表示法）
+            points = list(map(float, line[:8]))
+            category = line[8]
+            difficult = int(line[9]) if len(line) > 9 else 0
+
+            # === 4. 转换为COCO格式 ===
+            # 计算最小外接矩形（HBB）
+            x_coords = points[::2]
+            y_coords = points[1::2]
+            x_min, x_max = min(x_coords), max(x_coords)
+            y_min, y_max = min(y_coords), max(y_coords)
+            w = x_max - x_min
+            h = y_max - y_min
+
+            # 添加标注记录
+            coco_dict["annotations"].append({
+                "id": ann_id,
+                "image_id": img_id,
+                "category_id": class_names.index(category) + 1,
+                "bbox": [x_min, y_min, w, h],
+                "area": w * h,
+                "iscrowd": difficult,
+                "segmentation": [points]  # 保留原始多边形信息[1](@ref)
+            })
+            ann_id += 1
+
+    # === 5. 保存文件 ===
+    try:
+        with open(output_path, 'w') as f:
+            json.dump(coco_dict, f)
+    except Exception as e:
+        print(f"创建失败：{str(e)}")
+
+
+class DOTA2COCODataset(CocoDetection):
     def __init__(self, root, ann_file, transforms=None):
         if not os.path.exists(ann_file):
-            self.convert_dota_to_coco(root, ann_file)  # 新增转换方法
-        super().__init__(
-            root=os.path.join(root, 'images'),
-            annFile=ann_file,
-            transforms=transforms
-        )
-
-    def convert_dota_to_coco(self, root, output_path):
-        """
-        实现DOTA原生格式到COCO格式的转换
-        输入结构：
-        root/
-          ├── images/  # 存放所有图像文件
-          └── labelTxt/  # 存放DOTA格式的txt标注文件
-        """
-        # 初始化COCO结构
-        coco_dict = {
-            "info": {"description": "DOTA-COCO Format"},
-            "images": [],
-            "annotations": [],
-            "categories": []
-        }
-
-        # === 1. 构建类别映射 ===
-        class_names = [
-            'plane', 'ship', 'storage-tank', 'baseball-diamond', 'tennis-court',
-            'basketball-court', 'ground-track-field', 'harbor', 'bridge',
-            'large-vehicle', 'small-vehicle', 'helicopter', 'roundabout',
-            'soccer-ball-field', 'swimming-pool'
-        ]
-        coco_dict["categories"] = [{"id": i + 1, "name": n} for i, n in enumerate(class_names)]
-
-        # === 2. 遍历所有图像 ===
-        img_dir = os.path.join(root, "images")
-        ann_dir = os.path.join(root, "labelTxt")
-        img_files = [f for f in os.listdir(img_dir) if f.lower().endswith(('.png', '.jpg'))]
-
-        ann_id = 0
-        for img_id, img_file in enumerate(tqdm(img_files)):
-            # 获取图像尺寸
-            img_path = os.path.join(img_dir, img_file)
-            img = cv2.imread(img_path)
-            height, width = img.shape[:2]
-
-            # 添加图像记录
-            coco_dict["images"].append({
-                "id": img_id,
-                "file_name": img_file,
-                "width": width,
-                "height": height
-            })
-
-            # === 3. 解析DOTA标注 ===
-            ann_file = os.path.join(ann_dir, img_file.replace('.png', '.txt').replace('.jpg', '.txt'))
-            if not os.path.exists(ann_file):
-                continue
-
-            with open(ann_file, 'r') as f:
-                lines = [line.strip().split() for line in f if line.startswith('gsd') is False]
-
-            for line in lines:
-                if len(line) < 9: continue
-
-                # 解析DOTA多边形坐标（8点表示法）
-                points = list(map(float, line[:8]))
-                category = line[8]
-                difficult = int(line[9]) if len(line) > 9 else 0
-
-                # === 4. 转换为COCO格式 ===
-                # 计算最小外接矩形（HBB）
-                x_coords = points[::2]
-                y_coords = points[1::2]
-                x_min, x_max = min(x_coords), max(x_coords)
-                y_min, y_max = min(y_coords), max(y_coords)
-                w = x_max - x_min
-                h = y_max - y_min
-
-                # 添加标注记录
-                coco_dict["annotations"].append({
-                    "id": ann_id,
-                    "image_id": img_id,
-                    "category_id": class_names.index(category) + 1,
-                    "bbox": [x_min, y_min, w, h],
-                    "area": w * h,
-                    "iscrowd": difficult,
-                    "segmentation": [points]  # 保留原始多边形信息[1](@ref)
-                })
-                ann_id += 1
-
-        # === 5. 保存文件 ===
-        try:
-            with open(output_path, 'w') as f:
-                json.dump(coco_dict, f)
-        except Exception as e:
-            print(f"创建失败：{str(e)}")
+            convert_dota_to_coco(root, ann_file)  # 新增转换方法
+        super(DOTA2COCODataset, self).__init__(os.path.join(root, 'images'), ann_file)
+        self._transforms = transforms
+        self.prepare = ConvertCocoPolysToMask()
 
     def __getitem__(self, idx):
-        img, target = super().__getitem__(idx)
-
-        # === 图像预处理 ===
-        def preprocess_image(image):
-            # 转换PIL.Image到numpy数组
-            img_array = np.array(image)
-
-            # 动态缩放与填充
-            h, w = img_array.shape[:2]
-            scale = 1024 / max(h, w)
-            resized_img = cv2.resize(img_array, (int(w * scale), int(h * scale)))
-
-            # 右下填充
-            pad_h = 1024 - resized_img.shape[0]
-            pad_w = 1024 - resized_img.shape[1]
-            padded_img = np.pad(resized_img, ((0, pad_h), (0, pad_w), (0, 0)),
-                                mode='constant', constant_values=114)
-            assert padded_img.shape == (1024, 1024, 3), "图像尺寸错误"
-            # 转换为Tensor并归一化
-            return torch.from_numpy(padded_img).permute(2, 0, 1).float() / 255.0
-
-        # === 标注预处理 ===
-        def preprocess_ann(ann, scale):
-            # 调整框坐标
-            x, y, w, h = ann['bbox']
-            new_bbox = [
-                x * scale,
-                y * scale,
-                w * scale,
-                h * scale
-            ]
-
-            # 边界检查
-            new_bbox[0] = min(new_bbox[0], 1024 - new_bbox[2])
-            new_bbox[1] = min(new_bbox[1], 1024 - new_bbox[3])
-
-            return {
-                'boxes': torch.tensor([new_bbox], dtype=torch.float32),
-                'labels': torch.tensor([ann['category_id']], dtype=torch.int64),
-                'area': torch.tensor([ann['area'] * (scale ** 2)]),
-                'iscrowd': torch.tensor([ann['iscrowd']])
-            }
-
-        # 执行预处理
-        img_tensor = preprocess_image(img)
-        scale = 1024 / max(img.height, img.width)
-
-        # 整合标注
-        processed_target = {}
-        for key in ['boxes', 'labels', 'area', 'iscrowd']:
-            processed_target[key] = torch.cat([
-                preprocess_ann(ann, scale)[key] for ann in target
-            ], dim=0) if len(target) > 0 else torch.empty((0,))
-
-        processed_target['image_id'] = torch.tensor([target[0]['image_id']]) if target else torch.tensor([-1])
-
-        return img_tensor, processed_target
+        img, target = super(DOTA2COCODataset, self).__getitem__(idx)
+        image_id = self.ids[idx]
+        target = {'image_id': image_id, 'annotations': target}
+        img, target = self.prepare(img, target)
+        if self._transforms is not None:
+            img, target = self._transforms(img, target)
+        return img, target
 
     def __len__(self):
         return len(self.ids)
+
+
+class ConvertCocoPolysToMask(object):
+    def __init__(self, return_masks=False):
+        self.return_masks = return_masks
+
+    def __call__(self, image, target):
+        w, h = image.size
+
+        image_id = target["image_id"]
+        image_id = torch.tensor([image_id])
+
+        anno = target["annotations"]
+
+        anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0]
+
+        boxes = [obj["bbox"] for obj in anno]
+        # guard against no boxes via resizing
+        boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+        boxes[:, 2:] += boxes[:, :2]
+        boxes[:, 0::2].clamp_(min=0, max=w)
+        boxes[:, 1::2].clamp_(min=0, max=h)
+
+        classes = [obj["category_id"] for obj in anno]
+        classes = torch.tensor(classes, dtype=torch.int64)
+
+        keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
+        boxes = boxes[keep]
+        classes = classes[keep]
+        target = {}
+        target["boxes"] = boxes
+        target["labels"] = classes
+
+        # for conversion to coco api
+        area = torch.tensor([obj["area"] for obj in anno])
+        iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
+        target["area"] = area[keep]
+        target["iscrowd"] = iscrowd[keep]
+
+        target["orig_size"] = torch.as_tensor([int(h), int(w)])
+        target["size"] = torch.as_tensor([int(h), int(w)])
+
+        return image, target
+
+
+def make_coco_transforms(image_set):
+    normalize = T.Compose([
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+
+    if image_set == 'train':
+        return T.Compose([
+            T.RandomHorizontalFlip(),
+            T.RandomSelect(
+                T.RandomResize(scales, max_size=1333),
+                T.Compose([
+                    T.RandomResize([400, 500, 600]),
+                    T.RandomSizeCrop(384, 600),
+                    T.RandomResize(scales, max_size=1333),
+                ])
+            ),
+            normalize,
+        ])
+
+    if image_set == 'val':
+        return T.Compose([
+            T.RandomResize([800], max_size=1333),
+            normalize,
+        ])
+
+    raise ValueError(f'unknown {image_set}')
 
 
 # === 模型架构 ===
@@ -253,10 +281,10 @@ class DETR(nn.Module):
         features = self.conv(features)  # [B,256,32,32]
 
         # Position encoding
-        pos = self.pos_encoder(features) # [B,256,32,32]
+        pos = self.pos_encoder(features)  # [B,256,32,32]
 
         # Transformer
-        src = features.flatten(2).permute(2, 0, 1) # [1024, B, 256]
+        src = features.flatten(2).permute(2, 0, 1)  # [1024, B, 256]
         pos_embed = pos.flatten(2).permute(2, 0, 1)  # [1024, B, 256]
 
         # 维度校验
@@ -349,46 +377,10 @@ class SetCriterion(nn.Module):
         return batch_idx, src_idx
 
 
-def det_collate_fn(batch):
-    # 分离图像和目标
-    images = [item[0] for item in batch]
-    targets = [item[1] for item in batch]
-
-    # 堆叠图像张量 (假设所有图像已经预处理为相同尺寸)
-    images = torch.stack(images, dim=0)
-
-    # 为每个目标添加batch索引
-    indexed_targets = []
-    for batch_idx, target in enumerate(targets):
-        if target['boxes'].numel() > 0:
-            # 添加batch索引到boxes维度 [N,4] -> [N,5] (batch_idx, x1, y1, x2, y2)
-            indexed_boxes = torch.cat([
-                torch.full((target['boxes'].size(0), 1), batch_idx),  # 添加索引列
-                target['boxes']
-            ], dim=1)
-
-            indexed_targets.append({
-                'indexed_boxes': indexed_boxes,
-                'labels': target['labels'],
-                'image_id': target['image_id']
-            })
-
-    # 合并所有目标 (如果无目标则返回空张量)
-    structured_targets = {
-        'indexed_boxes': torch.cat([t['indexed_boxes'] for t in indexed_targets],
-                                   dim=0) if indexed_targets else torch.empty((0, 5)),
-        'labels': torch.cat([t['labels'] for t in indexed_targets], dim=0) if indexed_targets else torch.empty((0,)),
-        'image_ids': torch.cat([t['image_id'] for t in indexed_targets], dim=0) if indexed_targets else torch.empty(
-            (0,))
-    }
-
-    return images, structured_targets
-
-
 # === 训练与测试 ===
 def train(cfg):
-    train_set = DOTA2COCO(cfg.data_root, cfg.train_ann)
-    train_loader = DataLoader(train_set, batch_size=cfg.batch_size, collate_fn=det_collate_fn, shuffle=True)
+    train_set = DOTA2COCODataset(cfg.data_root, cfg.train_ann)
+    train_loader = DataLoader(train_set, batch_size=cfg.batch_size, collate_fn=collate_fn, shuffle=True)
 
     model = DETR(cfg).to(cfg.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
@@ -417,8 +409,8 @@ def evaluate(cfg, model_path):
     model.load_state_dict(torch.load(model_path))
     model.eval()
 
-    test_set = DOTA2COCO(cfg.data_root, cfg.val_ann)
-    test_loader = DataLoader(test_set, batch_size=cfg.batch_size, collate_fn=det_collate_fn)
+    test_set = DOTA2COCODataset(cfg.data_root, cfg.val_ann)
+    test_loader = DataLoader(test_set, batch_size=cfg.batch_size, collate_fn=collate_fn)
 
     coco_gt = COCO(os.path.join(cfg.data_root, cfg.val_ann))
     coco_dt = []
@@ -482,7 +474,7 @@ if __name__ == "__main__":
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     # 转换数据格式为coco形式
-    # dota2coco = DOTA2COCO(cfg.data_root, cfg.train_ann)
+    # dota2coco = DOTA2COCODataset(cfg.data_root, cfg.train_ann)
 
     # 训练与评估
     train(cfg)
