@@ -31,6 +31,7 @@ class Config:
     data_root = "./dota/train"
     train_ann = "./dota/train/annotations/train_coco.json"
     val_ann = "./dota/val/annotations/val_coco.json"
+    backbone = 'resnet50'
     num_classes = 15  # DOTA类别数
     hidden_dim = 256
     num_queries = 100
@@ -38,7 +39,7 @@ class Config:
     enc_layers = 3
     dec_layers = 3
     lr = 1e-4
-    batch_size = 4
+    batch_size = 2
     epochs = 50
     device = "cuda" if torch.cuda.is_available() else "cpu"
     output_dir = "./outputs"
@@ -138,7 +139,7 @@ def convert_dota_to_coco(root, output_path):
 class DOTA2COCODataset(CocoDetection):
     def __init__(self, root, ann_file, transforms=None):
         if not os.path.exists(ann_file):
-            convert_dota_to_coco(root, ann_file)  # 新增转换方法
+            convert_dota_to_coco(root, ann_file)  # 转换coco标注方法
         super(DOTA2COCODataset, self).__init__(os.path.join(root, 'images'), ann_file)
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask()
@@ -186,7 +187,7 @@ class ConvertCocoPolysToMask(object):
         target = {}
         target["boxes"] = boxes
         target["labels"] = classes
-
+        target["image_id"] = image_id
         # for conversion to coco api
         area = torch.tensor([obj["area"] for obj in anno])
         iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
@@ -246,7 +247,14 @@ class PositionEmbedding(nn.Module):
 
 
 class DETR(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
+        """
+        backbone：要使用的骨干网络模块。
+        transformer：要使用的 Transformer 架构模块。
+        num_classes：目标检测任务中的目标类别数。
+        num_queries：对象查询的数量，即模型可以在单个图像中检测的最大目标数量。
+        aux_loss：一个布尔值，表示是否使用辅助解码损失（在每个解码器层中计算损失）
+        """
         super().__init__()
         # Backbone
         # resnet = torch.hub.load('pytorch/vision', 'resnet50', pretrained=True) 运行不出来
@@ -379,7 +387,7 @@ class SetCriterion(nn.Module):
 
 # === 训练与测试 ===
 def train(cfg):
-    train_set = DOTA2COCODataset(cfg.data_root, cfg.train_ann)
+    train_set = DOTA2COCODataset(cfg.data_root, cfg.train_ann, transforms=make_coco_transforms("train"))
     train_loader = DataLoader(train_set, batch_size=cfg.batch_size, collate_fn=collate_fn, shuffle=True)
 
     model = DETR(cfg).to(cfg.device)
