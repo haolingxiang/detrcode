@@ -40,9 +40,12 @@ class Config:
     nheads = 8
     enc_layers = 3
     dec_layers = 3
+    dim_feedforward = 2048
     lr = 1e-4
+    lr_backbone = 1e-5
     batch_size = 2
     epochs = 50
+    dropout = 0.1
     device = "cuda" if torch.cuda.is_available() else "cpu"
     output_dir = "./outputs"
 
@@ -239,7 +242,7 @@ def train(cfg):
     train_set = DOTA2COCODataset(cfg.data_root, cfg.train_ann, transforms=make_coco_transforms("train"))
     train_loader = DataLoader(train_set, batch_size=cfg.batch_size, collate_fn=collate_fn, shuffle=True)
 
-    model = DETR(cfg.backbone, cfg.transformer).to(cfg.device)
+    model = DETR(cfg.backbone, cfg.transformer, ).to(cfg.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     criterion = SetCriterion(cfg.num_classes, HungarianMatcher())
 
