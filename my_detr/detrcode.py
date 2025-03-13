@@ -23,7 +23,9 @@ from tqdm import tqdm
 import torchvision.models as models
 from torchvision.datasets import CocoDetection
 import datasets.transforms as T
-from util.misc import collate_fn
+from models.detr import DETR, SetCriterion
+from models.matcher import HungarianMatcher
+from util.misc import collate_fn, nested_tensor_from_tensor_list, NestedTensor
 
 
 # === 配置参数 ===
@@ -231,166 +233,13 @@ def make_coco_transforms(image_set):
     raise ValueError(f'unknown {image_set}')
 
 
-# === 模型架构 ===
-class PositionEmbedding(nn.Module):
-    def __init__(self, d_model=256):
-        super().__init__()
-        self.d_model = d_model
-        self.div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        pos_x = torch.arange(W, device=x.device).reshape(1, 1, -1) * self.div_term
-        pos_y = torch.arange(H, device=x.device).reshape(1, -1, 1) * self.div_term
-        pos = torch.cat([pos_x.repeat(H, 1, 1), pos_y.repeat(1, W, 1)], dim=-1).permute(2, 0, 1)
-        return pos.repeat(B, 1, 1, 1).reshape(B, self.d_model, H, W)
-
-
-class DETR(nn.Module):
-    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
-        """
-        backbone：要使用的骨干网络模块。
-        transformer：要使用的 Transformer 架构模块。
-        num_classes：目标检测任务中的目标类别数。
-        num_queries：对象查询的数量，即模型可以在单个图像中检测的最大目标数量。
-        aux_loss：一个布尔值，表示是否使用辅助解码损失（在每个解码器层中计算损失）
-        """
-        super().__init__()
-        # Backbone
-        # resnet = torch.hub.load('pytorch/vision', 'resnet50', pretrained=True) 运行不出来
-        resnet = models.resnet50(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
-        self.conv = nn.Conv2d(2048, cfg.hidden_dim, 1)
-
-        # Transformer
-        self.pos_encoder = PositionEmbedding(cfg.hidden_dim)
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(cfg.hidden_dim, cfg.nheads, 2048),
-            cfg.enc_layers
-        )
-        self.decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(cfg.hidden_dim, cfg.nheads, 2048),
-            cfg.dec_layers
-        )
-        self.query_embed = nn.Embedding(cfg.num_queries, cfg.hidden_dim)
-
-        # Heads
-        self.class_head = nn.Linear(cfg.hidden_dim, cfg.num_classes + 1)
-        self.bbox_head = nn.Sequential(
-            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(cfg.hidden_dim, 4),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # Feature extraction
-        features = self.backbone(x)  # [B,2048,32,32]
-        features = self.conv(features)  # [B,256,32,32]
-
-        # Position encoding
-        pos = self.pos_encoder(features)  # [B,256,32,32]
-
-        # Transformer
-        src = features.flatten(2).permute(2, 0, 1)  # [1024, B, 256]
-        pos_embed = pos.flatten(2).permute(2, 0, 1)  # [1024, B, 256]
-
-        # 维度校验
-        assert src.shape == pos_embed.shape, \
-            f"特征序列{src.shape}与位置编码{pos_embed.shape}不匹配"
-        memory = self.encoder(src + pos_embed)
-
-        query = self.query_embed.weight.unsqueeze(1).repeat(1, x.size(0), 1)
-        hs = self.decoder(query, memory)
-
-        # Predictions
-        return {
-            'pred_logits': self.class_head(hs),
-            'pred_boxes': self.bbox_head(hs)
-        }
-
-
-# === 损失计算 ===
-class HungarianMatcher(nn.Module):
-    def __init__(self, cost_class=1, cost_bbox=5, cost_giou=2):
-        super().__init__()
-        self.cost_class = cost_class
-        self.cost_bbox = cost_bbox
-        self.cost_giou = cost_giou
-
-    @torch.no_grad()
-    def forward(self, outputs, targets):
-        pred_logits = outputs['pred_logits'].softmax(-1)  # [B,N,C+1]
-        pred_boxes = outputs['pred_boxes']  # [B,N,4]
-        batch_size = pred_logits.size(0)
-
-        indices = []
-        for b in range(batch_size):
-            tgt_ids = targets[b]['labels']
-            tgt_boxes = targets[b]['boxes']
-
-            # Cost matrix
-            cost_class = -pred_logits[b, :, tgt_ids]  # [N,M]
-            cost_bbox = torch.cdist(pred_boxes[b], tgt_boxes, p=1)
-            cost_giou = -generalized_box_iou(
-                box_cxcywh_to_xyxy(pred_boxes[b]),
-                box_cxcywh_to_xyxy(tgt_boxes)
-            )
-            C = self.cost_class * cost_class + self.cost_bbox * cost_bbox + self.cost_giou * cost_giou
-
-            # Hungarian matching
-            row_idx, col_idx = linear_sum_assignment(C.cpu())
-            indices.append((row_idx, col_idx))
-        return indices
-
-
-class SetCriterion(nn.Module):
-    def __init__(self, num_classes, matcher):
-        super().__init__()
-        self.num_classes = num_classes
-        self.matcher = matcher
-        self.alpha = 0.25  # Focal loss参数
-
-    def forward(self, outputs, targets):
-        indices = self.matcher(outputs, targets)
-        src_logits = outputs['pred_logits']  # [B,N,C+1]
-        src_boxes = outputs['pred_boxes']  # [B,N,4]
-
-        # 分类损失
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.long, device=src_logits.device)
-        for b, (row, col) in enumerate(indices):
-            target_classes[b, row] = targets[b]['labels'][col]
-
-        # Focal loss
-        class_loss = F.cross_entropy(src_logits.transpose(1, 2), target_classes,
-                                     reduction='none', weight=torch.tensor([1.0] * self.num_classes + [0.1]))
-
-        # 框回归损失
-        idx = self._get_src_permutation_idx(indices)
-        src_boxes_matched = src_boxes[idx]
-        tgt_boxes_matched = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-
-        # L1 + GIoU
-        l1_loss = F.l1_loss(src_boxes_matched, tgt_boxes_matched, reduction='none').sum(1)
-        giou_loss = 1 - torch.diag(generalized_box_iou(
-            box_cxcywh_to_xyxy(src_boxes_matched),
-            box_cxcywh_to_xyxy(tgt_boxes_matched)
-        ))
-        return (class_loss.mean() + l1_loss.mean() + giou_loss.mean()) / 3
-
-    def _get_src_permutation_idx(self, indices):
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
-
 
 # === 训练与测试 ===
 def train(cfg):
     train_set = DOTA2COCODataset(cfg.data_root, cfg.train_ann, transforms=make_coco_transforms("train"))
     train_loader = DataLoader(train_set, batch_size=cfg.batch_size, collate_fn=collate_fn, shuffle=True)
 
-    model = DETR(cfg).to(cfg.device)
+    model = DETR(cfg.backbone, cfg.transformer).to(cfg.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     criterion = SetCriterion(cfg.num_classes, HungarianMatcher())
 
