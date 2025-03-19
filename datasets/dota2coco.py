@@ -51,13 +51,13 @@ def convert_dota_to_coco(root, output_path):
         'plane', 'ship', 'storage-tank', 'baseball-diamond', 'tennis-court',
         'basketball-court', 'ground-track-field', 'harbor', 'bridge',
         'large-vehicle', 'small-vehicle', 'helicopter', 'roundabout',
-        'soccer-ball-field', 'swimming-pool'
+        'soccer-ball-field', 'swimming-pool', 'container-crane', 'airport', 'helipad'
     ]
     coco_dict["categories"] = [{"id": i + 1, "name": n} for i, n in enumerate(class_names)]
 
     # === 2. 遍历所有图像 ===
     img_dir = os.path.join(root, "images")
-    ann_dir = os.path.join(root, "labelTxt")
+    ann_dir = os.path.join(root, "labelTxt-v2.0")
     img_files = [f for f in os.listdir(img_dir) if f.lower().endswith(('.png', '.jpg'))]
 
     ann_id = 0
